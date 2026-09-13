@@ -4,11 +4,6 @@ import UIKit
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
-    private enum ConflictResolution {
-        case keepCurrent
-        case useBackup
-    }
-
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \DayEntry.capturedAt, order: .reverse) private var entries: [DayEntry]
@@ -142,6 +137,7 @@ struct SettingsView: View {
 
     @MainActor
     private func exportBackup() async {
+        guard !isExporting else { return }
         isExporting = true
         defer { isExporting = false }
         do {
@@ -163,6 +159,7 @@ struct SettingsView: View {
 
     @MainActor
     private func receiveImport(_ result: Result<[URL], Error>) async {
+        guard !isImporting else { return }
         isImporting = true
         defer { isImporting = false }
         do {
@@ -172,7 +169,7 @@ struct SettingsView: View {
 
             let plan = try await BackupService.shared.validateImport(sourceURL: localCopy)
             let currentKeys = Set(entries.map(\.dayKey))
-            conflictDayKeys = Set(plan.entries.map(\.dayKey)).intersection(currentKeys)
+            conflictDayKeys = ImportPlanner.conflictDayKeys(entries: plan.entries, existingDayKeys: currentKeys)
             pendingPlan = plan
             showingImportConfirmation = true
         } catch {
@@ -181,18 +178,16 @@ struct SettingsView: View {
     }
 
     @MainActor
-    private func applyImport(_ resolution: ConflictResolution) async {
-        guard let plan = pendingPlan else { return }
+    private func applyImport(_ resolution: ImportConflictResolution) async {
+        guard let plan = pendingPlan, !isImporting else { return }
         isImporting = true
         defer { isImporting = false }
 
-        let selectedEntries: [BackupEntry]
-        switch resolution {
-        case .keepCurrent:
-            selectedEntries = plan.entries.filter { !conflictDayKeys.contains($0.dayKey) }
-        case .useBackup:
-            selectedEntries = plan.entries
-        }
+        let selectedEntries = ImportPlanner.selectedEntries(
+            from: plan.entries,
+            conflictDayKeys: conflictDayKeys,
+            resolution: resolution
+        )
 
         let changes = selectedEntries.map { entry in
             PhotoStorage.ImportFileChange(
@@ -211,11 +206,7 @@ struct SettingsView: View {
             var oldFilesToDelete = Set<String>()
 
             for record in selectedEntries {
-                var descriptor = FetchDescriptor<DayEntry>(predicate: #Predicate { entry in
-                    entry.dayKey == record.dayKey
-                })
-                descriptor.fetchLimit = 1
-                if let existing = try modelContext.fetch(descriptor).first {
+                if let existing = try DayEntryStore.entry(for: record.dayKey, in: modelContext) {
                     if existing.photoFilename != record.localRelativePhotoPath {
                         oldFilesToDelete.insert(existing.photoFilename)
                     }
@@ -246,8 +237,10 @@ struct SettingsView: View {
 
             for record in selectedEntries {
                 await ThumbnailService.shared.clear(dayKey: record.dayKey)
-                let original = await PhotoStorage.shared.url(for: record.localRelativePhotoPath)
-                _ = try? await ThumbnailService.shared.thumbnailData(dayKey: record.dayKey, originalURL: original)
+                ThumbnailMemoryCache.shared.clear(dayKey: record.dayKey)
+                if let original = try? await PhotoStorage.shared.url(for: record.localRelativePhotoPath) {
+                    _ = try? await ThumbnailService.shared.thumbnailData(dayKey: record.dayKey, originalURL: original)
+                }
             }
 
             await BackupService.shared.cleanup(plan)
@@ -255,7 +248,7 @@ struct SettingsView: View {
             conflictDayKeys = []
             storageBytes = await PhotoStorage.shared.storageSize()
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            showSuccess("Imported \(selectedEntries.count) day\(selectedEntries.count == 1 ? "" : "s")")
+            showSuccess(selectedEntries.isEmpty ? "No changes imported" : "Imported \(selectedEntries.count) day\(selectedEntries.count == 1 ? "" : "s")")
         } catch {
             modelContext.rollback()
             if let fileToken { await PhotoStorage.shared.rollbackImportFiles(fileToken) }

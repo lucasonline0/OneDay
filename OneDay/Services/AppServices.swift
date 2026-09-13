@@ -68,19 +68,28 @@ struct DateService {
         return calendar.isDate(date, inSameDayAs: now)
     }
 
-    static func monthCountToCurrent(from earliestDayKey: String?, minimum: Int = 18) -> Int {
-        guard let earliestDayKey else { return minimum }
-        let parts = earliestDayKey.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3 else { return minimum }
+    static func isValidDayKey(_ value: String) -> Bool {
+        let parts = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts[0].count == 4,
+              parts[1].count == 2,
+              parts[2].count == 2,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let day = Int(parts[2]),
+              (1...9999).contains(year),
+              (1...12).contains(month),
+              (1...31).contains(day) else {
+            return false
+        }
 
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .autoupdatingCurrent
-        guard let earliestMonth = calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: 1)),
-              let currentMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: .now)),
-              let months = calendar.dateComponents([.month], from: earliestMonth, to: currentMonth).month else {
-            return minimum
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        guard let date = calendar.date(from: DateComponents(year: year, month: month, day: day)) else {
+            return false
         }
-        return max(minimum, months + 1)
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return components.year == year && components.month == month && components.day == day
     }
 }
 
@@ -98,25 +107,29 @@ actor PhotoStorage {
         fileprivate let previouslyExisting: Set<String>
     }
 
-    private let fileManager = FileManager.default
+    private let fileManager: FileManager
     private let photosRoot: URL
 
-    init() {
-        let support = try! FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        photosRoot = support.appendingPathComponent("OneDay/Photos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
+    init(rootURL: URL? = nil, fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+        if let rootURL {
+            photosRoot = rootURL.standardizedFileURL
+        } else {
+            let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? fileManager.temporaryDirectory
+            photosRoot = support.appendingPathComponent("OneDay/Photos", isDirectory: true).standardizedFileURL
+        }
+        try? fileManager.createDirectory(at: photosRoot, withIntermediateDirectories: true)
     }
 
     func saveCaptured(data: Data, dayKey: String, fileExtension: String) throws -> String {
+        guard DateService.isValidDayKey(dayKey) else { throw OneDayError.invalidDate }
+        let normalizedExtension = fileExtension.lowercased()
+        guard ["heic", "jpg", "jpeg"].contains(normalizedExtension) else { throw OneDayError.invalidImage }
+
         let parts = dayKey.split(separator: "-")
-        guard parts.count == 3 else { throw OneDayError.invalidDate }
-        let relative = "\(parts[0])/\(parts[1])/\(dayKey).\(fileExtension)"
-        let destination = safeURL(relativePath: relative)
+        let relative = "\(parts[0])/\(parts[1])/\(dayKey).\(normalizedExtension)"
+        let destination = try safeURL(relativePath: relative)
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard !fileManager.fileExists(atPath: destination.path) else {
             throw OneDayError.dayAlreadyCaptured
@@ -125,12 +138,13 @@ actor PhotoStorage {
         return relative
     }
 
-    func url(for relativePath: String) -> URL {
-        safeURL(relativePath: relativePath)
+    func url(for relativePath: String) throws -> URL {
+        try safeURL(relativePath: relativePath)
     }
 
     func remove(relativePath: String) {
-        try? fileManager.removeItem(at: safeURL(relativePath: relativePath))
+        guard let url = try? safeURL(relativePath: relativePath) else { return }
+        try? fileManager.removeItem(at: url)
     }
 
     func storageSize() -> Int64 {
@@ -159,7 +173,7 @@ actor PhotoStorage {
 
         do {
             for change in changes {
-                let destination = safeURL(relativePath: change.destinationRelativePath)
+                let destination = try safeURL(relativePath: change.destinationRelativePath)
                 try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
 
                 if fileManager.fileExists(atPath: destination.path) {
@@ -197,7 +211,7 @@ actor PhotoStorage {
 
     func rollbackImportFiles(_ token: ImportCommitToken) {
         for relative in token.touchedRelativePaths.reversed() {
-            let destination = safeURL(relativePath: relative)
+            guard let destination = try? safeURL(relativePath: relative) else { continue }
             try? fileManager.removeItem(at: destination)
             if token.previouslyExisting.contains(relative) {
                 let backup = token.rollbackDirectory.appendingPathComponent(relative)
@@ -212,10 +226,14 @@ actor PhotoStorage {
         try? fileManager.removeItem(at: token.rollbackDirectory)
     }
 
-    private func safeURL(relativePath: String) -> URL {
+    private func safeURL(relativePath: String) throws -> URL {
+        guard BackupService.isSafeArchivePath(relativePath),
+              !relativePath.hasPrefix("photos/") else {
+            throw OneDayError.unsafeArchive
+        }
         let candidate = photosRoot.appendingPathComponent(relativePath).standardizedFileURL
-        guard candidate.path.hasPrefix(photosRoot.standardizedFileURL.path + "/") else {
-            return photosRoot.appendingPathComponent("__invalid_path__")
+        guard candidate.path.hasPrefix(photosRoot.path + "/") else {
+            throw OneDayError.unsafeArchive
         }
         return candidate
     }
@@ -227,13 +245,19 @@ actor ThumbnailService {
     private let fileManager = FileManager.default
     private let root: URL
 
-    init() {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        root = caches.appendingPathComponent("OneDay/Thumbnails", isDirectory: true)
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    init(rootURL: URL? = nil) {
+        if let rootURL {
+            root = rootURL.standardizedFileURL
+        } else {
+            let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            root = caches.appendingPathComponent("OneDay/Thumbnails", isDirectory: true)
+        }
+        try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
     func thumbnailData(dayKey: String, originalURL: URL) throws -> Data {
+        guard DateService.isValidDayKey(dayKey) else { throw OneDayError.invalidDate }
         let destination = root.appendingPathComponent("\(dayKey).jpg")
         if fileManager.fileExists(atPath: destination.path) {
             return try Data(contentsOf: destination, options: [.mappedIfSafe])
@@ -275,7 +299,7 @@ struct BackupSource: Sendable {
     let height: Int
 }
 
-struct BackupManifest: Codable, Sendable {
+struct BackupManifest: Codable, Sendable, Equatable {
     let schemaVersion: Int
     let app: String
     let exportedAt: Date
@@ -296,6 +320,30 @@ struct BackupEntry: Codable, Sendable, Hashable {
     }
 }
 
+enum ImportConflictResolution: Sendable {
+    case keepCurrent
+    case useBackup
+}
+
+struct ImportPlanner {
+    static func conflictDayKeys(entries: [BackupEntry], existingDayKeys: Set<String>) -> Set<String> {
+        Set(entries.map(\.dayKey)).intersection(existingDayKeys)
+    }
+
+    static func selectedEntries(
+        from entries: [BackupEntry],
+        conflictDayKeys: Set<String>,
+        resolution: ImportConflictResolution
+    ) -> [BackupEntry] {
+        switch resolution {
+        case .keepCurrent:
+            entries.filter { !conflictDayKeys.contains($0.dayKey) }
+        case .useBackup:
+            entries
+        }
+    }
+}
+
 struct ImportPlan: Sendable, Identifiable {
     let id = UUID()
     let workingDirectory: URL
@@ -306,7 +354,11 @@ actor BackupService {
     static let shared = BackupService()
     static let schemaVersion = 1
 
-    private let fileManager = FileManager.default
+    private let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+    }
 
     func copySecurityScopedImportToTemporary(_ source: URL) throws -> URL {
         let accessed = source.startAccessingSecurityScopedResource()
@@ -331,7 +383,7 @@ actor BackupService {
 
         var entries: [BackupEntry] = []
         for source in sources {
-            let original = await PhotoStorage.shared.url(for: source.photoFilename)
+            let original = try await PhotoStorage.shared.url(for: source.photoFilename)
             guard fileManager.fileExists(atPath: original.path) else { throw OneDayError.missingPhoto }
             entries.append(
                 BackupEntry(
@@ -362,13 +414,13 @@ actor BackupService {
         nameFormatter.locale = Locale(identifier: "en_US_POSIX")
         nameFormatter.dateFormat = "yyyy-MM-dd-HHmmss"
         let archiveURL = fileManager.temporaryDirectory
-            .appendingPathComponent("OneDay-\(nameFormatter.string(from: .now)).oneday")
+            .appendingPathComponent("OneDay-\(nameFormatter.string(from: .now))-\(UUID().uuidString.prefix(8)).oneday")
         try? fileManager.removeItem(at: archiveURL)
 
         let archive = try Archive(url: archiveURL, accessMode: .create)
         try archive.addEntry(with: "manifest.json", fileURL: manifestURL, compressionMethod: .deflate)
         for source in sources {
-            let original = await PhotoStorage.shared.url(for: source.photoFilename)
+            let original = try await PhotoStorage.shared.url(for: source.photoFilename)
             try archive.addEntry(
                 with: "photos/\(source.photoFilename)",
                 fileURL: original,
@@ -388,9 +440,12 @@ actor BackupService {
             var archivePaths = Set<String>()
             for entry in archive {
                 guard archivePaths.insert(entry.path).inserted else { throw OneDayError.unsafeArchive }
-                guard isSafeArchivePath(entry.path) else { throw OneDayError.unsafeArchive }
+                guard Self.isSafeArchivePath(entry.path) else { throw OneDayError.unsafeArchive }
                 if entry.type == .directory { continue }
                 guard entry.type == .file else { throw OneDayError.unsafeArchive }
+                guard entry.path == "manifest.json" || entry.path.hasPrefix("photos/") else {
+                    throw OneDayError.unsafeArchive
+                }
 
                 let destination = work.appendingPathComponent(entry.path).standardizedFileURL
                 guard destination.path.hasPrefix(work.standardizedFileURL.path + "/") else {
@@ -401,6 +456,7 @@ actor BackupService {
             }
 
             let manifestURL = work.appendingPathComponent("manifest.json")
+            guard fileManager.fileExists(atPath: manifestURL.path) else { throw OneDayError.unsupportedBackup }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let manifest = try decoder.decode(BackupManifest.self, from: Data(contentsOf: manifestURL))
@@ -410,16 +466,22 @@ actor BackupService {
 
             var dayKeys = Set<String>()
             for entry in manifest.entries {
-                guard isValidDayKey(entry.dayKey), entry.width > 0, entry.height > 0 else {
+                guard DateService.isValidDayKey(entry.dayKey), entry.width > 0, entry.height > 0 else {
                     throw OneDayError.unsupportedBackup
                 }
                 guard TimeZone(identifier: entry.timeZoneIdentifier) != nil else { throw OneDayError.unsupportedBackup }
                 guard dayKeys.insert(entry.dayKey).inserted else { throw OneDayError.duplicateBackupDay }
-                guard entry.photoFilename.hasPrefix("photos/"), isSafeArchivePath(entry.photoFilename) else {
+                guard entry.photoFilename.hasPrefix("photos/"), Self.isSafeArchivePath(entry.photoFilename) else {
+                    throw OneDayError.unsafeArchive
+                }
+                let localPath = entry.localRelativePhotoPath
+                guard Self.isSafeArchivePath(localPath), !localPath.hasPrefix("photos/") else {
                     throw OneDayError.unsafeArchive
                 }
                 let photoURL = work.appendingPathComponent(entry.photoFilename).standardizedFileURL
-                guard fileManager.fileExists(atPath: photoURL.path) else { throw OneDayError.missingPhoto }
+                guard photoURL.path.hasPrefix(work.path + "/"), fileManager.fileExists(atPath: photoURL.path) else {
+                    throw OneDayError.missingPhoto
+                }
                 guard try sha256(of: photoURL) == entry.sha256.lowercased() else {
                     throw OneDayError.hashMismatch
                 }
@@ -436,23 +498,17 @@ actor BackupService {
         try? fileManager.removeItem(at: plan.workingDirectory)
     }
 
-    private func isValidDayKey(_ value: String) -> Bool {
-        let parts = value.split(separator: "-")
-        guard parts.count == 3,
-              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]),
-              (1...9999).contains(year), (1...12).contains(month), (1...31).contains(day) else { return false }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar.date(from: DateComponents(year: year, month: month, day: day)) != nil
-    }
-
-    private func isSafeArchivePath(_ path: String) -> Bool {
+    static func isSafeArchivePath(_ path: String) -> Bool {
         guard !path.isEmpty,
               !path.hasPrefix("/"),
               !path.hasPrefix("\\"),
               !path.contains("\\"),
-              !path.contains(":") else { return false }
-        return !NSString(string: path).pathComponents.contains("..")
+              !path.contains(":"),
+              !path.contains("\0") else {
+            return false
+        }
+        let components = NSString(string: path).pathComponents
+        return !components.contains("..") && !components.contains(".")
     }
 
     private func sha256(of url: URL) throws -> String {

@@ -2,7 +2,10 @@ import SwiftUI
 import UIKit
 
 struct PhotoViewer: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     let entry: DayEntry
+    let namespace: Namespace.ID
     let onClose: () -> Void
 
     @State private var image: UIImage?
@@ -12,10 +15,7 @@ struct PhotoViewer: View {
             Color.black.ignoresSafeArea()
 
             if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                photo(image)
             } else {
                 ProgressView().tint(.white)
             }
@@ -50,11 +50,30 @@ struct PhotoViewer: View {
                 .padding(.bottom, 18)
             }
         }
-        .task {
-            let url = await PhotoStorage.shared.url(for: entry.photoFilename)
-            image = UIImage(contentsOfFile: url.path)
+        .task(id: entry.photoFilename) {
+            guard let url = try? await PhotoStorage.shared.url(for: entry.photoFilename) else { return }
+            let data = try? await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: url, options: [.mappedIfSafe])
+            }.value
+            if let data {
+                image = UIImage(data: data)
+            }
         }
         .statusBarHidden()
+    }
+
+    @ViewBuilder
+    private func photo(_ image: UIImage) -> some View {
+        let content = Image(uiImage: image)
+            .resizable()
+            .scaledToFit()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+        if reduceMotion {
+            content
+        } else {
+            content.matchedGeometryEffect(id: "photo-\(entry.dayKey)", in: namespace)
+        }
     }
 
     private var dateText: String {

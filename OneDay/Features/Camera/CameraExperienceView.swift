@@ -27,7 +27,7 @@ struct CameraExperienceView: View {
                     Color.black.ignoresSafeArea()
                 }
 
-                if controller.accessState == .authorized {
+                if controller.accessState == .authorized, canCaptureToday {
                     CameraPreview(session: controller.session)
                         .frame(
                             width: isExpanded ? expandedWidth : collapsedWidth,
@@ -55,9 +55,9 @@ struct CameraExperienceView: View {
                             y: isExpanded ? proxy.size.height / 2 : collapsedY
                         )
                         .shadow(color: .black.opacity(isExpanded ? 0 : 0.13), radius: 9, y: 4)
-                        .accessibilityLabel(canCaptureToday ? "Open camera" : "Today's photo is already captured")
+                        .accessibilityLabel("Open camera")
                 } else if !isExpanded {
-                    permissionCapsule
+                    collapsedStatus
                         .position(x: proxy.size.width / 2, y: collapsedY)
                 }
 
@@ -86,27 +86,25 @@ struct CameraExperienceView: View {
         }
     }
 
-    private var permissionCapsule: some View {
-        Button {
-            Task {
-                guard canCaptureToday else {
-                    report("Today already has a photo.")
-                    return
-                }
-                if await controller.requestAccessAndStart() {
-                    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                    isExpanded = true
-                } else {
-                    report(controller.accessState == .denied ? OneDayError.cameraDenied.localizedDescription : OneDayError.cameraUnavailable.localizedDescription)
-                }
-            }
-        } label: {
-            Image(systemName: canCaptureToday ? "camera" : "checkmark")
+    @ViewBuilder
+    private var collapsedStatus: some View {
+        if !canCaptureToday {
+            Image(systemName: "checkmark")
                 .font(.system(size: 16, weight: .semibold))
                 .frame(width: 108, height: 42)
+                .glassEffect(in: .capsule)
+                .accessibilityLabel("Today's photo is already captured")
+        } else {
+            Button {
+                Task { await requestCameraAccess() }
+            } label: {
+                Image(systemName: "camera")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 108, height: 42)
+            }
+            .buttonStyle(.glass)
+            .accessibilityLabel(controller.accessState == .notDetermined ? "Enable camera" : "Camera unavailable")
         }
-        .buttonStyle(.glass)
-        .accessibilityLabel(canCaptureToday ? "Enable camera" : "Today's photo is already captured")
     }
 
     @ViewBuilder
@@ -166,6 +164,7 @@ struct CameraExperienceView: View {
                     }
                     .buttonStyle(.glass)
                     .disabled(isSaving)
+                    .accessibilityLabel("Retake photo")
 
                     Button {
                         Task { await usePhoto(photo) }
@@ -179,6 +178,7 @@ struct CameraExperienceView: View {
                     }
                     .buttonStyle(.glassProminent)
                     .disabled(isSaving)
+                    .accessibilityLabel("Use photo")
                 }
                 .padding(.horizontal, 18)
                 .padding(.bottom, proxy.safeAreaInsets.bottom + 18)
@@ -186,11 +186,21 @@ struct CameraExperienceView: View {
         }
     }
 
-    private func openCamera() {
-        guard canCaptureToday else {
-            report("Today already has a photo.")
-            return
+    private func requestCameraAccess() async {
+        guard canCaptureToday else { return }
+        if await controller.requestAccessAndStart() {
+            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+            isExpanded = true
+        } else {
+            let message = (controller.accessState == .denied || controller.accessState == .restricted)
+                ? OneDayError.cameraDenied.localizedDescription
+                : OneDayError.cameraUnavailable.localizedDescription
+            report(message)
         }
+    }
+
+    private func openCamera() {
+        guard canCaptureToday else { return }
         UIImpactFeedbackGenerator(style: .soft).impactOccurred()
         Task {
             guard await controller.start() else {
@@ -218,16 +228,13 @@ struct CameraExperienceView: View {
 
     @MainActor
     private func usePhoto(_ photo: CapturedPhoto) async {
+        guard !isSaving else { return }
         isSaving = true
         defer { isSaving = false }
 
         let dayKey = DateService.dayKey(for: photo.capturedAt, timeZoneIdentifier: photo.timeZoneIdentifier)
         do {
-            var descriptor = FetchDescriptor<DayEntry>(predicate: #Predicate { entry in
-                entry.dayKey == dayKey
-            })
-            descriptor.fetchLimit = 1
-            guard try modelContext.fetch(descriptor).isEmpty else {
+            guard try !DayEntryStore.contains(dayKey: dayKey, in: modelContext) else {
                 throw OneDayError.dayAlreadyCaptured
             }
 
@@ -255,8 +262,10 @@ struct CameraExperienceView: View {
                 throw error
             }
 
-            let original = await PhotoStorage.shared.url(for: filename)
-            _ = try? await ThumbnailService.shared.thumbnailData(dayKey: dayKey, originalURL: original)
+            if let original = try? await PhotoStorage.shared.url(for: filename) {
+                _ = try? await ThumbnailService.shared.thumbnailData(dayKey: dayKey, originalURL: original)
+            }
+            ThumbnailMemoryCache.shared.clear(dayKey: dayKey)
 
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             reviewPhoto = nil
