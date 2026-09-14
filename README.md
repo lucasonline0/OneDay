@@ -12,4 +12,12 @@ OneDay is a private, local-first iPhone app that lets you capture exactly one ph
 - originals remain inside the app sandbox
 - portable `.oneday` export/import for device migration
 
-The app implementation lives on the `feat/initial-mvp` branch while the first production-ready MVP is assembled.
+## Validation
+
+The `feat/initial-mvp` implementation has been validated in CI on macOS 26 / Xcode 26.6:
+
+- iOS Simulator build passes
+- unit tests pass
+- critical date, uniqueness, backup integrity, path-safety, and conflict-resolution logic is covered
+
+Physical-device acceptance is still required for the real camera pipeline, haptics, visual camera morph, and the complete export/reinstall/import flow before the MVP is considered fully accepted.
